@@ -102,6 +102,7 @@ For each heartbeat run you get:
 - error text and stderr/stdout excerpts
 - token usage/cost when available from the adapter
 - full logs (stored outside core run rows, optimized for large output)
+- `lastHeartbeatAt` on the agent record, which now refreshes during an active run when Paperclip observes new run events or log output
 
 In local/dev setups, full logs are stored on disk under the configured run-log path.
 
@@ -112,6 +113,7 @@ Paperclip pushes runtime/activity updates to the browser in real time.
 You should see live changes for:
 
 - agent status
+- agent heartbeat freshness while a run is still actively producing output
 - heartbeat run status
 - task/activity updates caused by agent work
 - dashboard/cost/activity panels as relevant

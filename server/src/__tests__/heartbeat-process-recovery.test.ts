@@ -4,8 +4,10 @@ import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
+  agentRuntimeState,
   agentWakeupRequests,
   companies,
+  companySkills,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -15,7 +17,12 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { runningProcesses } from "../adapters/index.ts";
+import {
+  registerServerAdapter,
+  runningProcesses,
+  type ServerAdapterModule,
+  unregisterServerAdapter,
+} from "../adapters/index.js";
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentFirstHeartbeat = vi.hoisted(() => vi.fn());
 
@@ -36,6 +43,7 @@ vi.mock("@paperclipai/shared/telemetry", async () => {
 import { heartbeatService } from "../services/heartbeat.ts";
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const HEARTBEAT_ACTIVITY_TEST_ADAPTER = "heartbeat_activity_test";
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -49,6 +57,22 @@ function spawnAliveProcess() {
   });
 }
 
+async function waitFor<T>(
+  read: () => Promise<T>,
+  predicate: (value: T) => boolean,
+  timeoutMs = 5_000,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  let lastValue = await read();
+  while (Date.now() < deadline) {
+    if (predicate(lastValue)) {
+      return lastValue;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    lastValue = await read();
+  }
+  throw new Error(`Timed out waiting for expected condition. Last value: ${JSON.stringify(lastValue)}`);
+}
 describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -61,6 +85,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   afterEach(async () => {
     vi.clearAllMocks();
+    unregisterServerAdapter(HEARTBEAT_ACTIVITY_TEST_ADAPTER);
     runningProcesses.clear();
     for (const child of childProcesses) {
       child.kill("SIGKILL");
@@ -70,7 +95,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(agentRuntimeState);
     await db.delete(agents);
+    await db.delete(companySkills);
     await db.delete(companies);
   });
 
@@ -256,11 +283,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   it("clears the detached warning when the run reports activity again", async () => {
-    const { runId } = await seedRunFixture({
+    const { agentId, runId } = await seedRunFixture({
       includeIssue: false,
       runErrorCode: "process_detached",
       runError: "Lost in-memory process handle, but child pid 123 is still alive",
     });
+    const staleHeartbeatAt = new Date("2026-03-18T23:00:00.000Z");
+    await db.update(agents).set({ lastHeartbeatAt: staleHeartbeatAt }).where(eq(agents.id, agentId));
     const heartbeat = heartbeatService(db);
 
     const updated = await heartbeat.reportRunActivity(runId);
@@ -270,6 +299,105 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const run = await heartbeat.getRun(runId);
     expect(run?.errorCode).toBeNull();
     expect(run?.error).toBeNull();
+
+    const agent = await db
+      .select()
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(agent?.lastHeartbeatAt?.getTime()).toBeGreaterThan(staleHeartbeatAt.getTime());
+  });
+
+  it("advances lastHeartbeatAt while a live run is still streaming logs", async () => {
+    let allowCompletion = () => undefined;
+    let markStarted = () => undefined;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const completionGate = new Promise<void>((resolve) => {
+      allowCompletion = resolve;
+    });
+
+    const adapter: ServerAdapterModule = {
+      type: HEARTBEAT_ACTIVITY_TEST_ADAPTER,
+      execute: async ({ onLog }) => {
+        await onLog("stdout", "still working\n");
+        markStarted();
+        await completionGate;
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+        };
+      },
+      testEnvironment: async () => ({
+        adapterType: HEARTBEAT_ACTIVITY_TEST_ADAPTER,
+        status: "pass",
+        checks: [],
+        testedAt: new Date().toISOString(),
+      }),
+    };
+    registerServerAdapter(adapter);
+
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const staleHeartbeatAt = new Date("2026-03-18T23:00:00.000Z");
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "LogTouchAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: HEARTBEAT_ACTIVITY_TEST_ADAPTER,
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+      lastHeartbeatAt: staleHeartbeatAt,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const queuedRun = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      contextSnapshot: {},
+    });
+    expect(queuedRun?.id).toBeTruthy();
+
+    await started;
+
+    const runningRun = await waitFor(
+      async () => heartbeat.getRun(queuedRun!.id),
+      (run) => run?.status === "running",
+    );
+    expect(runningRun?.status).toBe("running");
+
+    const refreshedAgent = await waitFor(
+      async () =>
+        db
+          .select()
+          .from(agents)
+          .where(eq(agents.id, agentId))
+          .then((rows) => rows[0] ?? null),
+      (agent) => (agent?.lastHeartbeatAt?.getTime() ?? 0) > staleHeartbeatAt.getTime(),
+    );
+    expect(refreshedAgent?.status).toBe("running");
+
+    allowCompletion();
+
+    const finishedRun = await waitFor(
+      async () => heartbeat.getRun(queuedRun!.id),
+      (run) => run?.status === "succeeded",
+    );
+    expect(finishedRun?.status).toBe("succeeded");
   });
 
   it("tracks the first heartbeat with the agent role instead of adapter type", async () => {

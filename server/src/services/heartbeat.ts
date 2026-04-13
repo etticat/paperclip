@@ -76,6 +76,7 @@ const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
+const RUN_ACTIVITY_TOUCH_INTERVAL_MS = 15_000;
 const execFile = promisify(execFileCallback);
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
@@ -85,6 +86,7 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
   "opencode_local",
   "pi_local",
 ]);
+const lastRunActivityTouchAtByRun = new Map<string, number>();
 
 export function applyPersistedExecutionWorkspaceConfig(input: {
   config: Record<string, unknown>;
@@ -1668,6 +1670,10 @@ export function heartbeatService(db: Db) {
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
   ) {
+    if (status !== "running") {
+      lastRunActivityTouchAtByRun.delete(runId);
+    }
+
     const updated = await db
       .update(heartbeatRuns)
       .set({ status, ...patch, updatedAt: new Date() })
@@ -1741,6 +1747,11 @@ export function heartbeatService(db: Db) {
       payload: sanitizedPayload,
     });
 
+    if (run.status === "running") {
+      await touchRunningRunActivity(run).catch((err) =>
+        logger.warn({ err, runId: run.id }, "failed to advance agent heartbeat metadata after run event"));
+    }
+
     publishLiveEvent({
       companyId: run.companyId,
       type: "heartbeat.run.event",
@@ -1783,6 +1794,85 @@ export function heartbeatService(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
+  async function touchRunningRunActivity(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "agentId" | "companyId" | "status">,
+    opts?: { force?: boolean },
+  ) {
+    if (run.status !== "running") return null;
+
+    const nowMs = Date.now();
+    const previousTouchAt = lastRunActivityTouchAtByRun.get(run.id) ?? 0;
+    if (!opts?.force && nowMs - previousTouchAt < RUN_ACTIVITY_TOUCH_INTERVAL_MS) {
+      return null;
+    }
+
+    lastRunActivityTouchAtByRun.set(run.id, nowMs);
+    const touchedAt = new Date(nowMs);
+
+    try {
+      const activeRun = await db
+        .update(heartbeatRuns)
+        .set({
+          updatedAt: touchedAt,
+        })
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
+        .returning({
+          id: heartbeatRuns.id,
+          agentId: heartbeatRuns.agentId,
+          companyId: heartbeatRuns.companyId,
+        })
+        .then((rows) => rows[0] ?? null);
+
+      if (!activeRun) {
+        lastRunActivityTouchAtByRun.delete(run.id);
+        return null;
+      }
+
+      const updatedAgent = await db
+        .update(agents)
+        .set({
+          lastHeartbeatAt: touchedAt,
+          updatedAt: touchedAt,
+        })
+        .where(eq(agents.id, activeRun.agentId))
+        .returning({
+          id: agents.id,
+          companyId: agents.companyId,
+          status: agents.status,
+          lastHeartbeatAt: agents.lastHeartbeatAt,
+        })
+        .then((rows) => rows[0] ?? null);
+
+      if (updatedAgent) {
+        publishLiveEvent({
+          companyId: updatedAgent.companyId,
+          type: "agent.status",
+          payload: {
+            agentId: updatedAgent.id,
+            status: updatedAgent.status,
+            lastHeartbeatAt: updatedAgent.lastHeartbeatAt
+              ? new Date(updatedAgent.lastHeartbeatAt).toISOString()
+              : null,
+            outcome: "activity",
+          },
+        });
+      }
+
+      return {
+        runId: activeRun.id,
+        agentId: activeRun.agentId,
+        touchedAt,
+      };
+    } catch (error) {
+      if (previousTouchAt > 0) {
+        lastRunActivityTouchAtByRun.set(run.id, previousTouchAt);
+      } else {
+        lastRunActivityTouchAtByRun.delete(run.id);
+      }
+      throw error;
+    }
+  }
+
   async function clearDetachedRunWarning(runId: string) {
     const updated = await db
       .update(heartbeatRuns)
@@ -1805,6 +1895,16 @@ export function heartbeatService(db: Db) {
     return updated;
   }
 
+  async function reportRunActivity(runId: string) {
+    const updated = await clearDetachedRunWarning(runId);
+    if (updated) return updated;
+
+    const run = await getRun(runId);
+    if (!run || run.status !== "running") return null;
+
+    await touchRunningRunActivity(run, { force: true });
+    return run;
+  }
   async function enqueueProcessLossRetry(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -2769,6 +2869,9 @@ export function heartbeatService(db: Db) {
             ts,
           });
         }
+
+        await touchRunningRunActivity(currentRun).catch((err) =>
+          logger.warn({ err, runId: currentRun.id }, "failed to advance agent heartbeat metadata after run log"));
 
         const payloadChunk =
           sanitizedChunk.length > MAX_LIVE_LOG_CHUNK_BYTES
@@ -4169,7 +4272,7 @@ export function heartbeatService(db: Db) {
 
     wakeup: enqueueWakeup,
 
-    reportRunActivity: clearDetachedRunWarning,
+    reportRunActivity,
 
     reapOrphanedRuns,
 

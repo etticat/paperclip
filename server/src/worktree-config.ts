@@ -18,6 +18,30 @@ function resolveHomeAwarePath(value: string): string {
   return path.resolve(expandHomePrefix(value));
 }
 
+function parseIntegerPort(value: string | null | undefined): number | null {
+  const normalized = nonEmpty(value);
+  if (!normalized) return null;
+  const parsed = Number.parseInt(normalized, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function parseConnectionStringPort(value: string | null | undefined): number | null {
+  const normalized = nonEmpty(value);
+  if (!normalized) return null;
+  try {
+    const parsed = new URL(normalized);
+    if (parsed.port) {
+      return parseIntegerPort(parsed.port);
+    }
+    if (parsed.protocol === "postgres:" || parsed.protocol === "postgresql:") {
+      return 5432;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 function sanitizeWorktreeInstanceId(rawValue: string): string {
   const trimmed = rawValue.trim().toLowerCase();
   const normalized = trimmed
@@ -454,11 +478,17 @@ export function maybePersistWorktreeRuntimePorts(input: {
     return;
   }
 
+  const envServerPort = parseIntegerPort(process.env.PORT);
+  const envDatabasePort = parseConnectionStringPort(process.env.DATABASE_URL);
   const { config, changed } = applyRuntimePortSelectionToConfig(fileConfig, {
     serverPort: input.serverPort,
     databasePort: input.databasePort,
-    allowServerPortWrite: !nonEmpty(process.env.PORT),
-    allowDatabasePortWrite: !nonEmpty(process.env.DATABASE_URL),
+    allowServerPortWrite: envServerPort === null || envServerPort !== input.serverPort,
+    allowDatabasePortWrite:
+      !nonEmpty(process.env.DATABASE_URL) ||
+      (typeof input.databasePort === "number" &&
+        envDatabasePort !== null &&
+        envDatabasePort !== input.databasePort),
   });
 
   if (changed) {

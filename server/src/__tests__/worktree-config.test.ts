@@ -397,6 +397,7 @@ describe("worktree config repair", () => {
     process.env.PAPERCLIP_HOME = isolatedHome;
     process.env.PAPERCLIP_INSTANCE_ID = "pap-878-create-a-mine-tab-in-inbox";
     process.env.PAPERCLIP_CONFIG = configPath;
+    process.env.PORT = "3100";
 
     maybePersistWorktreeRuntimePorts({
       serverPort: 3103,
@@ -407,6 +408,90 @@ describe("worktree config repair", () => {
 
     expect(writtenConfig.server.port).toBe(3103);
     expect(writtenConfig.database.embeddedPostgresPort).toBe(54335);
+    expect(writtenConfig.auth.publicBaseUrl).toBe("http://127.0.0.1:3103/");
+  });
+
+  it("keeps explicit env-driven worktree ports out of the stored config", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-explicit-env-"));
+    const worktreeRoot = path.join(tempRoot, "PAP-878-create-a-mine-tab-in-inbox");
+    const paperclipDir = path.join(worktreeRoot, ".paperclip");
+    const configPath = path.join(paperclipDir, "config.json");
+    const isolatedHome = path.join(tempRoot, ".paperclip-worktrees");
+    const instanceRoot = path.join(isolatedHome, "instances", "pap-878-create-a-mine-tab-in-inbox");
+
+    await fs.mkdir(paperclipDir, { recursive: true });
+    await fs.writeFile(
+      configPath,
+      JSON.stringify(
+        {
+          ...buildLegacyConfig(instanceRoot),
+          database: {
+            mode: "embedded-postgres",
+            embeddedPostgresDataDir: path.join(instanceRoot, "db"),
+            embeddedPostgresPort: 54331,
+            backup: {
+              enabled: true,
+              intervalMinutes: 60,
+              retentionDays: 30,
+              dir: path.join(instanceRoot, "data", "backups"),
+            },
+          },
+          logging: {
+            mode: "file",
+            logDir: path.join(instanceRoot, "logs"),
+          },
+          server: {
+            deploymentMode: "local_trusted",
+            exposure: "private",
+            host: "127.0.0.1",
+            port: 3101,
+            allowedHostnames: [],
+            serveUi: true,
+          },
+          storage: {
+            provider: "local_disk",
+            localDisk: {
+              baseDir: path.join(instanceRoot, "data", "storage"),
+            },
+            s3: {
+              bucket: "paperclip",
+              region: "us-east-1",
+              prefix: "",
+              forcePathStyle: false,
+            },
+          },
+          secrets: {
+            provider: "local_encrypted",
+            strictMode: false,
+            localEncrypted: {
+              keyFilePath: path.join(instanceRoot, "secrets", "master.key"),
+            },
+          },
+        },
+        null,
+        2,
+      ) + "\n",
+      "utf8",
+    );
+
+    process.chdir(worktreeRoot);
+    process.env.PAPERCLIP_IN_WORKTREE = "true";
+    process.env.PAPERCLIP_WORKTREE_NAME = "PAP-878-create-a-mine-tab-in-inbox";
+    process.env.PAPERCLIP_HOME = isolatedHome;
+    process.env.PAPERCLIP_INSTANCE_ID = "pap-878-create-a-mine-tab-in-inbox";
+    process.env.PAPERCLIP_CONFIG = configPath;
+    process.env.PORT = "3103";
+    process.env.DATABASE_URL = "postgres://paperclip:test@127.0.0.1:54335/paperclip";
+
+    maybePersistWorktreeRuntimePorts({
+      serverPort: 3103,
+      databasePort: 54335,
+    });
+
+    const writtenConfig = JSON.parse(await fs.readFile(configPath, "utf8"));
+
+    expect(writtenConfig.server.port).toBe(3101);
+    expect(writtenConfig.database.embeddedPostgresPort).toBe(54331);
     expect(writtenConfig.auth.publicBaseUrl).toBe("http://127.0.0.1:3103/");
   });
 

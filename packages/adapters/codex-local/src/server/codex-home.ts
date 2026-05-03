@@ -64,9 +64,16 @@ async function ensureSymlink(target: string, source: string): Promise<void> {
   await fs.symlink(source, target);
 }
 
-async function ensureCopiedFile(target: string, source: string): Promise<void> {
+async function ensureCopiedFile(
+  target: string,
+  source: string,
+  options: { replaceExisting?: boolean } = {},
+): Promise<void> {
   const existing = await fs.lstat(target).catch(() => null);
-  if (existing) return;
+  if (existing) {
+    if (!options.replaceExisting) return;
+    await fs.rm(target, { force: true, recursive: false });
+  }
   await ensureParentDir(target);
   await fs.copyFile(source, target);
 }
@@ -79,25 +86,32 @@ export async function prepareManagedCodexHome(
   const targetHome = resolveManagedCodexHomeDir(env, companyId);
 
   const sourceHome = resolveSharedCodexHomeDir(env);
+  const worktreeMode = isWorktreeMode(env);
   if (path.resolve(sourceHome) === path.resolve(targetHome)) return targetHome;
 
   await fs.mkdir(targetHome, { recursive: true });
 
-  for (const name of SYMLINKED_SHARED_FILES) {
+  const copiedSharedFiles = worktreeMode
+    ? [...new Set([...SYMLINKED_SHARED_FILES, ...COPIED_SHARED_FILES])]
+    : COPIED_SHARED_FILES;
+
+  for (const name of worktreeMode ? [] : SYMLINKED_SHARED_FILES) {
     const source = path.join(sourceHome, name);
     if (!(await pathExists(source))) continue;
     await ensureSymlink(path.join(targetHome, name), source);
   }
 
-  for (const name of COPIED_SHARED_FILES) {
+  for (const name of copiedSharedFiles) {
     const source = path.join(sourceHome, name);
     if (!(await pathExists(source))) continue;
-    await ensureCopiedFile(path.join(targetHome, name), source);
+    await ensureCopiedFile(path.join(targetHome, name), source, {
+      replaceExisting: worktreeMode && SYMLINKED_SHARED_FILES.includes(name),
+    });
   }
 
   await onLog(
     "stdout",
-    `[paperclip] Using ${isWorktreeMode(env) ? "worktree-isolated" : "Paperclip-managed"} Codex home "${targetHome}" (seeded from "${sourceHome}").\n`,
+    `[paperclip] Using ${worktreeMode ? "worktree-isolated" : "Paperclip-managed"} Codex home "${targetHome}" (seeded from "${sourceHome}").\n`,
   );
   return targetHome;
 }

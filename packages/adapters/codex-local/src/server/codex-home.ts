@@ -133,7 +133,7 @@ export async function prepareManagedCodexHome(
       const source = path.join(sourceHome, name);
       if (!(await pathExists(source))) continue;
       await ensureCopiedFile(path.join(targetHome, name), source, {
-        replaceExisting: worktreeMode && SYMLINKED_SHARED_FILES.includes(name),
+        replaceExisting: worktreeMode && name === "auth.json",
       });
     }
 

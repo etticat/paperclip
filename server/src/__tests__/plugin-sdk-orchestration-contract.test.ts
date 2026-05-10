@@ -70,7 +70,7 @@ describe("plugin SDK orchestration contract", () => {
     const created = await harness.ctx.issues.create({
       companyId,
       title: "Generated issue",
-      status: "todo",
+      status: "blocked",
       assigneeUserId: "board-user",
       billingCode: "mission:alpha",
       originId: "mission-alpha",
@@ -80,6 +80,7 @@ describe("plugin SDK orchestration contract", () => {
     expect(created.originKind).toBe("plugin:paperclip.test-orchestration");
     expect(created.originId).toBe("mission-alpha");
     expect(created.billingCode).toBe("mission:alpha");
+    expect(created.status).toBe("blocked");
     expect(created.assigneeUserId).toBe("board-user");
 
     await expect(harness.ctx.issues.relations.get(created.id, companyId)).resolves.toEqual({
@@ -148,6 +149,23 @@ describe("plugin SDK orchestration contract", () => {
         companyId,
       ),
     ).rejects.toThrow("Plugin may only use originKind values under plugin:paperclip.test-orchestration");
+  });
+
+  it("supports generic plugin operation issue visibility in the test harness", async () => {
+    const companyId = randomUUID();
+    const harness = createTestHarness({
+      manifest: manifest(["issues.create"]),
+    });
+
+    const created = await harness.ctx.issues.create({
+      companyId,
+      title: "Background operation",
+      surfaceVisibility: "plugin_operation",
+      originId: "operation-1",
+    });
+
+    expect(created.originKind).toBe("plugin:paperclip.test-orchestration:operation");
+    expect(created.originId).toBe("operation-1");
   });
 
   it("enforces checkout and wakeup capabilities in the test harness", async () => {
